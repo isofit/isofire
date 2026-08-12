@@ -42,7 +42,7 @@ uv sync --extra cuda12       # GPU JAX (recommended)
 
 ## Build 6S
 
-The retrieval calls a 6S Fortran binary as a subprocess. [6sMultiComponent](https://github.com/isofit/6sMultiComponent) is vendored under `sixs/`, so a fresh clone has everything it needs. Requires `gfortran`.
+The retrieval calls a 6S Fortran binary as a subprocess. [6s](https://github.com/isofit/6s) is vendored under `sixs/`, so a fresh clone has everything it needs. Requires `gfortran`.
 
 ```
 cd sixs/Sixs
