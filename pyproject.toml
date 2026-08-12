@@ -1,0 +1,158 @@
+# pyproject.toml  -  isofire-science (PyPI)  /  isofire (import name)
+#
+# AVIRIS-3 two-component Gaussian fire-temperature retrieval, packaged for
+# `pip install` so third parties can:
+#
+#     pip install isofire-science                 # CPU JAX
+#     pip install "isofire-science[cuda12]"       # GPU JAX
+#
+# After install:
+#     import isofire
+#     from isofire import run_moment_matched_retrieval, MixtureRetrievalConfig
+#     from isofire.rt import radiative_transfer_engine
+#     isofire-science --help                      # console script
+#
+# uv-managed workflow for development:
+#     uv sync                                     # CPU JAX, editable install
+#     uv sync --extra cuda12                      # GPU JAX
+#     uv run isofire-science --help
+#     uv run pytest
+
+[project]
+name = "isofire-science"
+version = "0.1.0"
+description = "AVIRIS-3 two-component Gaussian fire-temperature retrieval (moment-matched single Gaussian output)."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "William R. Keely", email = "william.r.keely@jpl.nasa.gov" },
+    { name = "Philip G. Brodrick", email = "philip.brodrick@jpl.nasa.gov" },
+]
+keywords = ["aviris", "fire", "temperature", "retrieval", "remote-sensing", "spectroscopy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Pinned to the actual third-party imports across the package.
+# All floors chosen to be NumPy 2.x compatible.
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2.2",        # first pandas release that supports NumPy 2
+    "scipy>=1.13",          # first SciPy release that supports NumPy 2
+    "rasterio>=1.3.10",     # first rasterio release that supports NumPy 2
+    "spectral>=0.24",
+    "jax>=0.4.31",          # first JAX release that ships NumPy 2 wheels
+    "optax>=0.2.3",
+    "ngboost>=0.5.11",
+    "scikit-learn>=1.7.2",
+    "joblib>=1.5.3",
+]
+
+[project.optional-dependencies]
+# GPU JAX wheel (CUDA 12). Pick this on hosts with a GPU.
+cuda12 = [
+    "jax[cuda12]>=0.4.31",
+]
+# Lightweight devtools - formatters, type checking, smoke tests.
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+# `isofire-science` resolves to `isofire.airborne:main`.
+# Equivalent to: `python -m isofire.airborne ...`
+isofire-science = "isofire.airborne:main"
+
+[project.urls]
+Repository = "https://github.com/pgbrodrick/ISOFire-science"
+Issues = "https://github.com/pgbrodrick/ISOFire-science/issues"
+
+# ----------------------------------------------------------------------------
+# Build system - hatchling, which plays nicely with uv.
+# ----------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+# Find the package under src/.
+[tool.hatch.build.targets.wheel]
+packages = ["src/isofire"]
+
+# Auxiliary data files (fire_library.csv, kurudz_0.1nm.dat) live at
+# src/isofire/data/ and are included automatically as package data because
+# they sit inside the packaged directory. The resolver in airborne.py looks
+# there first (after honoring $ISOFIRE_DATA_DIR), so users get a working CLI
+# straight from `pip install`.
+
+# Source distribution: include the apptainer recipe and a small subset of
+# repo-level files, not the heavy results/ directory or notebook checkpoints.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/isofire/",
+    "apptainer/",
+    "examples/",
+    "tests/",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+    ".python-version",
+]
+exclude = [
+    "**/__pycache__/",
+    "**/.ipynb_checkpoints/",
+    "results/",
+]
+
+# ----------------------------------------------------------------------------
+# uv settings
+# ----------------------------------------------------------------------------
+[tool.uv]
+# Install the project itself (editable) into the venv on `uv sync`. This
+# makes `import isofire` and `isofire-science` work after a single command.
+package = true
+
+# ----------------------------------------------------------------------------
+# Pytest
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+filterwarnings = [
+    "ignore::DeprecationWarning:jax.*",
+    "ignore::UserWarning:jax.*",
+]
+
+# ----------------------------------------------------------------------------
+# Linters / formatters (used only with the [dev] extra)
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # long lines are tolerable in this codebase
+    "E731",   # we use a couple of lambdas in 6S parsing
+]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+mypy_path = "src"

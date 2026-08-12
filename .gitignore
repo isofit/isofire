@@ -1,0 +1,14 @@
+src/isofire/data/*.joblib
+sixs/Sixs/*.o
+sixs/Sixs/sixsV2.1*
+results/
+*.tif
+*.out
+*.err
+*.log
+.venv/
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store
