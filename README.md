@@ -26,7 +26,7 @@ Two entry points share the same retrieval:
 |---|---|
 | `isofire.rt` | Physics: 6S templating and parsing, spectral resampling, emissive radiance. |
 | `isofire.retrieval` | Algorithms: water vapor, endmembers, masks, the mixture solver, moment matching. |
-| `isofire.airborne` | Scene watcher, ortho warp, GeoTIFF output. Shared I/O helpers. |
+| `isofire.airborne` | Scene watcher, ortho, GeoTIFF output. Shared I/O helpers. |
 | `isofire.onboard` | Scene watcher for flight operations, pre-ortho ENVI output. |
 
 ## Installation
