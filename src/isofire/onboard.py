@@ -2,38 +2,33 @@
 #
 #  Copyright 2024 California Institute of Technology
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+#  Licensed under the Apache License, Version 2.0 (the "License").
+#  http://www.apache.org/licenses/LICENSE-2.0
 #
 #  Authors: william.r.keely@jpl.nasa.gov
-
-
 """AVIRIS-3 onboard fire-temperature watcher (pre-ortho).
 
 Flight-computer entry point. Reads one ``--input_dir`` holding ENVI files for
-one or more AV3 scenes, grouped by scene id (``AV3<date><time>[_<chunk>]``), and
-processes a scene once its RDN, LOC, BANDMASK/sat and OBS ENVI pairs are all
-present. Products are written unwarped into ``--to_ortho_dir`` as ENVI pairs for
-a downstream ortho step: ``<scene_id>_fireTemp_toOrtho``,
+one or more AVIRIS-3 or AVIRIS-5 scenes, grouped by scene id
+(``AV[35]<date><time>[_<chunk>]``). Behaviour differs by instrument in two
+places and nowhere else: AVIRIS-5 screens on the absolute band difference
+rather than HFDI, and FRP is skipped for AVIRIS-5 because the model is
+AVIRIS-3 only. A
+scene is processed once its RDN, LOC, BANDMASK/sat and OBS ENVI pairs are all
+present. Products are written unwarped into ``--to_ortho_dir`` as ENVI pairs
+(binary with no extension + ``.hdr``) for a downstream ortho step to warp
+through the GLT: ``<scene_id>_fireTemp_toOrtho``,
 ``<scene_id>_fireTempUnc_toOrtho``, and with ``--frp_model`` also
 ``<scene_id>_fireFRP_toOrtho`` and ``<scene_id>_fireFRPUnc_toOrtho``.
 
 The scene id, including its ``T<HHMMSS>`` system-time stamp, is taken verbatim
-from the RDN filename, and L1B inputs are never deleted. Fire pixels are
-screened pre-fit with the HFDI index, and a scene whose inputs stay incomplete
-for ``--scene_timeout_seconds`` is abandoned.
+from the RDN filename; no time conversion is performed. L1B inputs are never
+deleted. Fire pixels are screened pre-fit with the HFDI index. A scene whose
+inputs stay incomplete for ``--scene_timeout_seconds`` is abandoned, and with
+``--exit_on_timeout`` the watcher exits nonzero for a supervisor to restart.
 
-Algorithm and physics live in retrieval.py and rt.py; shared I/O helpers come
-from airborne.py. This file is orchestration only.
+Algorithm/physics live in retrieval.py and rt.py; shared I/O helpers come from
+airborne.py. This file is orchestration only.
 """
 
 from __future__ import annotations
@@ -50,15 +45,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from spectral.io import envi
 
-# Silence noisy JAX float64 warnings before importing jax.
+"""Silence noisy JAX float64 warnings before importing jax."""
 warnings.filterwarnings("ignore", message=".*float64.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*64-bit.*", category=UserWarning)
 
 import jax
 jax.config.update("jax_enable_x64", False)
 
-# Shared helpers from airborne.py; none are ortho-specific, so moving them to a
-# common.py would drop the rasterio dependency here.
+"""Shared helpers from the airborne entry point. Move these to a common.py to
+drop the rasterio dependency; none are ortho-specific."""
 from .airborne import (
     DEFAULT_FIRE_LIB_CSV,
     DEFAULT_SENSOR_WL_FWHM_FILE,
@@ -98,37 +93,41 @@ from .retrieval import (
 )
 
 
-# User knobs: defaults for commonly-tweaked CLI flags, all CLI-overridable.
+# User knobs -----------------------------------------------------------------
+"""Defaults for commonly-tweaked CLI flags; the CLI overrides any of these."""
 
-# Input dir with every scene's ENVI files; output dir for every product.
+"""Input dir with every scene's ENVI files; output dir for every product."""
 DEFAULT_INPUT_DIR: Optional[str] = None
 DEFAULT_TO_ORTHO_DIR: Optional[str] = None
 
-# Poll interval, scene-assembly limit, and the age an input must reach before it
-# counts as fully written.
+"""Poll interval, scene-assembly limit, and the age an input must reach before
+it counts as fully written."""
 USER_POLL_SECONDS: float = 10.0
 USER_SCENE_TIMEOUT_SECONDS: float = 300.0
 USER_SETTLE_SECONDS: float = 5.0
 
-# Single-Gaussian post-processing (sigma scaling).
+"""Single-Gaussian post-processing (sigma scaling)."""
 USER_ALPHA_TUNING: float = DEFAULT_ALPHA_TUNING
 USER_SIGMA_MIN_K: float = DEFAULT_SIGMA_MIN_K
 
-# Last-band go/no-go: pixel retrieved only if rdn[..., -1] > USER_DARK_THRESH.
+"""Last-band go/no-go: pixel retrieved only if rdn[..., -1] > USER_DARK_THRESH."""
 USER_DARK_THRESH: float = 0.15
 USER_SKIP_DARK_PIXELS: bool = True
 
-# Night / twilight handling: above NIGHT_SZA_DEG the solar path carries no
-# signal, so solar irradiance is zeroed (leaving a thermal-only fit) and the
-# 940 nm water retrieval is replaced by a fixed H2OSTR. 6S is not meaningful at
-# large solar zenith either, so the LUT is built at no more than MAX_LUT_SZA_DEG.
+"""Night / twilight handling. Above NIGHT_SZA_DEG the solar path carries no
+signal: solar irradiance is zeroed (which makes the forward model's solar
+baseline exactly 0, leaving a thermal-only fit) and the 940 nm water retrieval
+is replaced by a fixed H2OSTR, since it measures reflected sunlight. 6S is not
+meaningful at large solar zenith either, so the LUT is always built at no more
+than MAX_LUT_SZA_DEG; upwelling transmittance, the only RT term a night scene
+uses, is insensitive to solar zenith."""
 USER_NIGHT_SZA_DEG: float = 90.0
 USER_MAX_LUT_SZA_DEG: float = 85.0
 USER_NIGHT_WATER_VAPOR: float = 1.0
 
-# Fill for non-retrieved pixels, echoed in the header as 'data ignore value'.
-# Real E[T] and sigma are strictly positive, so -1 leaves 0 free for the
-# downstream ortho step to mark out-of-swath.
+"""Fill for non-retrieved pixels, echoed in the header as 'data ignore value'.
+-1 leaves 0 free for the downstream ortho step to mark out-of-swath; real E[T]
+and sigma are strictly positive, so both are unambiguous."""
 USER_FILL_VALUE: float = -1.0
 
 
@@ -136,9 +135,10 @@ class WaterVaporCarry:
     """Remembers the last daylight scene's median H2OSTR for night scenes.
 
     The 940 nm retrieval needs reflected sunlight, so a night scene cannot
-    measure water vapor at all, and a value carried from earlier in the same
-    flight beats any fixed guess. The value is also persisted to disk, so a
-    watcher restarted after dark still has it.
+    measure water vapor at all. Atmospheric water changes slowly, so a value
+    carried from earlier in the same flight beats any fixed guess. The value is
+    also written to disk under the LUT scratch root, so a watcher restarted
+    after dark still has it.
     """
 
     def __init__(self, path: Optional[str] = None):
@@ -149,7 +149,6 @@ class WaterVaporCarry:
         self._load()
 
     def _load(self) -> None:
-        """Read a previously persisted carry value, if one exists."""
         if not self.path or not os.path.exists(self.path):
             return
         try:
@@ -166,7 +165,7 @@ class WaterVaporCarry:
                   f"starting with no carried value.")
 
     def update(self, water: np.ndarray, scene_id: str, sza: float) -> None:
-        """Record a daylight scene's median H2OSTR; a no-op if none is finite."""
+        """Record a daylight scene's median H2OSTR. No-op if none is finite."""
         arr = np.asarray(water, dtype=np.float64)
         fin = arr[np.isfinite(arr)]
         if fin.size == 0:
@@ -188,13 +187,13 @@ class WaterVaporCarry:
             print(f"[water] WARNING: could not persist to {self.path}: {e!r}")
 
 
-# Scene discovery
+# Scene discovery ------------------------------------------------------------
 
-# GLT is absent: orthorectification happens downstream.
+"""GLT is absent: orthorectification happens downstream."""
 REQUIRED_KIND_KEYS = ("rdn", "loc", "mask", "obs")
 
-# Product suffixes; the binary carries no extension and the header is <stem>.hdr
-# (e.g. AV320260602T213058_fireTempUnc_toOrtho[.hdr]).
+"""Product suffixes. Binary carries no extension, header is <stem>.hdr, e.g.
+AV320260602T213058_fireTempUnc_toOrtho[.hdr]"""
 PRODUCT_SUFFIXES: Dict[str, str] = {
     "fire_temp": "_fireTemp_toOrtho",
     "fire_temp_unc": "_fireTempUnc_toOrtho",
@@ -206,7 +205,7 @@ PRODUCT_SUFFIXES: Dict[str, str] = {
 def _file_settled(path: str, settle_seconds: float, now: float) -> bool:
     """True if ``path`` exists and is at least ``settle_seconds`` old.
 
-    Keeps a cube the flight computer is still writing from being opened;
+    Keeps a cube the flight computer is still writing from being opened.
     ``settle_seconds <= 0`` disables the check.
     """
     try:
@@ -218,26 +217,46 @@ def _file_settled(path: str, settle_seconds: float, now: float) -> bool:
     return (now - float(st.st_mtime)) >= float(settle_seconds)
 
 
+AV5_PRODUCT_SUBDIRS = ("l1b_rdn", "l1b_ort")
+
+
+def _search_dirs(input_dir: str) -> list:
+    """Directories to scan.
+
+    Flight writes every product into one directory. The AVIRIS-5 archive splits
+    a line into l1b_rdn (RDN, BANDMASK) and l1b_ort (OBS, LOC, GLT); those are
+    scanned when present. A flight inbox has neither and falls through.
+    """
+    sub = [os.path.join(input_dir, d) for d in AV5_PRODUCT_SUBDIRS
+           if os.path.isdir(os.path.join(input_dir, d))]
+    return sub if sub else [input_dir]
+
+
 def discover_ready_scenes(
     *,
     input_dir: str,
     required: Sequence[str] = REQUIRED_KIND_KEYS,
     settle_seconds: float = 0.0,
+    require_chunk: bool = False,
 ) -> Tuple[dict, dict]:
     """Return (ready, partial) scene maps from a single input directory.
 
-    Groups ENVI .hdr files by (scene_id, kind), counting one only when its binary
-    cube exists and both files have settled, and drops any pair matching more
-    than one file. Anything missing a required kind lands in ``partial``, and GLT
-    files are ignored.
+    Groups ENVI .hdr files by (scene_id, kind), counting one only when its
+    binary cube exists and both files have settled, and drops any pair matching
+    more than one file so a scene is never picked from ambiguous candidates.
+    ``ready[scene_id]`` has every kind in ``required``; anything missing lands
+    in ``partial[scene_id]``. GLT files are ignored.
     """
     import glob as _glob
     if not input_dir or not os.path.isdir(input_dir):
         return {}, {}
 
     now = time.time()
-    hits = sorted(set(_glob.glob(os.path.join(input_dir, "*.hdr"))
-                      + _glob.glob(os.path.join(input_dir, "*.HDR"))))
+    hits = []
+    for d in _search_dirs(input_dir):
+        hits += _glob.glob(os.path.join(d, "*.hdr"))
+        hits += _glob.glob(os.path.join(d, "*.HDR"))
+    hits = sorted(set(hits))
 
     by_scene: Dict[str, Dict[str, str]] = {}
     dupe_keys: set = set()
@@ -246,6 +265,11 @@ def discover_ready_scenes(
         if cls is None:
             continue
         kind, scene_id, _base, _chunk = cls
+        # The AVIRIS-5 archive holds unchunked full-line OBS/LOC/GLT with
+        # no matching RDN, which would wait in 'partial' until timeout.
+        # Off by default: a flight scene may have no _NNN suffix.
+        if require_chunk and _chunk is None:
+            continue
         if kind not in required:
             continue
         binary = _envi_binary_for_hdr(h)
@@ -253,7 +277,7 @@ def discover_ready_scenes(
             continue
         if not (_file_settled(h, settle_seconds, now)
                 and _file_settled(binary, settle_seconds, now)):
-            # Still being written; the scene stays partial this pass.
+            """Still being written; the scene stays partial this pass."""
             by_scene.setdefault(scene_id, {})
             continue
         slot = by_scene.setdefault(scene_id, {})
@@ -277,7 +301,11 @@ def discover_ready_scenes(
 
 
 def output_stem(scene_id: str, product: str, to_ortho_dir: str) -> str:
-    """Path stem (no extension) for a product; the header is ``<stem>.hdr``."""
+    """Path stem (no extension) for a product; header is ``<stem>.hdr``.
+
+    ``scene_id`` comes off the RDN filename, so its ``T<HHMMSS>`` system-time
+    stamp carries through untouched.
+    """
     try:
         suffix = PRODUCT_SUFFIXES[product]
     except KeyError:
@@ -293,7 +321,7 @@ def _product_exists(stem: str) -> bool:
     return os.path.exists(stem) and os.path.exists(stem + ".hdr")
 
 
-# ENVI product writing
+# ENVI product writing -------------------------------------------------------
 
 ENVI_DATA_TYPE_FLOAT32 = 4
 
@@ -309,9 +337,12 @@ def write_envi_single_band(
 ) -> Tuple[str, str]:
     """Write a single-band float32 BSQ ENVI pair, unwarped, to ``stem``.
 
-    Both files are staged as ``.part`` and renamed into place, binary first, so a
-    downstream watcher keying on the header never sees one pointing at a
-    half-written cube. Returns (binary_path, header_path).
+    Binary goes to ``stem``, header to ``stem + '.hdr'``. Both are staged as
+    ``.part`` and renamed into place, binary first, so a downstream watcher
+    keying on the header never sees one pointing at a half-written cube.
+    Non-finite values become ``data_ignore_value``.
+
+    Returns (binary_path, header_path).
     """
     arr = np.asarray(data, dtype=np.float32)
     if arr.ndim != 2:
@@ -348,8 +379,8 @@ def write_envi_single_band(
         f.write("\n".join(lines) + "\n")
     os.replace(hdr_tmp, hdr_path)
 
-    # Per-output summary: shape plus the value distribution over retrieved
-    # pixels, so a dtype/scaling bug shows as an out-of-range value.
+    """Per-output summary: shape plus the value distribution over retrieved
+    pixels, so a dtype/scaling bug shows as an out-of-range value."""
     basename = os.path.basename(stem)
     size_mb = os.path.getsize(stem) / 1024.0 / 1024.0
     fill = np.float32(data_ignore_value)
@@ -359,7 +390,7 @@ def write_envi_single_band(
                                float(real.max()))
         summary = (f"vals[min/med/max]=({v_min:.1f}, {v_med:.1f}, {v_max:.1f})")
         bl = basename.lower()
-        # _fireTempUnc contains _fireTemp as a substring: test Unc FIRST.
+        """_fireTempUnc contains _fireTemp as a substring: test Unc FIRST."""
         if "_firetempunc" in bl:
             lo, hi, kind = 0.0, 1000.0, "fireTempUnc (sigma, K)"
         elif "_firetemp" in bl:
@@ -380,18 +411,21 @@ def write_envi_single_band(
     return stem, hdr_path
 
 
-# HFDI pre-fit fire screen
+# HFDI pre-fit fire screen ---------------------------------------------------
 
-# Hyperspectral Fire Detection Index:
-#     HFDI = (L(2430 nm) - L(2061 nm)) / (L(2430 nm) + L(2061 nm))
-# Non-fire surfaces are brighter at 2061 nm, so HFDI sits well below zero, while
-# thermal emission from fire lifts the 2430 nm end and drives the index up.
+"""Hyperspectral Fire Detection Index:
+
+    HFDI = (L(2430 nm) - L(2061 nm)) / (L(2430 nm) + L(2061 nm))
+
+Non-fire surfaces are brighter at 2061 nm than at 2430 nm, so HFDI sits well
+below zero; thermal emission from fire lifts the 2430 nm end and drives the
+index up. Pixels at or below --hfdi_min are dropped before the fit."""
 HFDI_LO_NM_DEFAULT = 2061.0
 HFDI_HI_NM_DEFAULT = 2430.0
 HFDI_MIN_DEFAULT = -0.1
 
-# Nearest band must land within this distance of each target, else the screen is
-# disabled rather than indexing the wrong part of the spectrum.
+"""Nearest band must land within this distance of each target, else the screen
+is disabled rather than indexing the wrong part of the spectrum."""
 HFDI_BAND_DISTANCE_MAX_NM = 5.0
 
 
@@ -405,9 +439,10 @@ def _nearest_band(wl_nm: np.ndarray, target_nm: float) -> Tuple[int, float]:
 def _band_saturated(bm_flat: np.ndarray, bands: int, band_idx: int) -> np.ndarray:
     """Per-pixel saturation flag for ONE band, without unpacking the full mask.
 
-    Packed bits are indexed directly (band i is byte i // 8, bit 7 - (i % 8),
-    matching numpy's MSB-first unpackbits), avoiding the ~285 MB per-band array
-    ``decode_sat_ok`` would build.
+    ``decode_sat_ok`` builds an (n_pix, bands) bool array (~285 MB on 1 Mpix)
+    and the retrieval already pays that once. Only two bands are needed here, so
+    packed bits are indexed directly: band i is byte i // 8, bit 7 - (i % 8),
+    matching numpy's MSB-first unpackbits.
     """
     bm = np.asarray(bm_flat, dtype=np.uint8)
     bm = bm.reshape(bm.shape[0], -1) if bm.ndim > 1 else bm[:, None]
@@ -432,8 +467,9 @@ def compute_hfdi(
 ) -> Tuple[np.ndarray, Tuple[int, float], Tuple[int, float]]:
     """Per-pixel HFDI at the sensor bands nearest each target.
 
-    Returns (hfdi_flat, (lo_idx, lo_actual_nm), (hi_idx, hi_actual_nm)); HFDI is
-    NaN where the denominator collapses, which the screen drops as non-fire.
+    Returns (hfdi_flat, (lo_idx, lo_actual_nm), (hi_idx, hi_actual_nm)). HFDI is
+    NaN where the denominator collapses (both bands dark); such pixels are not
+    fire and the screen drops them.
     """
     n_bands = int(np.asarray(wl_nm).size)
     rdn2 = np.asarray(rdn, dtype=np.float32).reshape(-1, n_bands)
@@ -446,6 +482,81 @@ def compute_hfdi(
     with np.errstate(divide="ignore", invalid="ignore"):
         hfdi = np.where(np.abs(denom) > 1e-12, (L_hi - L_lo) / denom, np.nan)
     return hfdi.astype(np.float32), (lo_idx, lo_act), (hi_idx, hi_act)
+
+
+BAND_DIFF_MIN_DEFAULT = 0.15     # uW/cm^2/sr/nm, AVIRIS-5 only
+
+
+def scene_instrument(scene_id: str) -> str:
+    """'AV3', 'AV5', or 'unknown' from a scene id."""
+    m = re.match(r"(AV[35])", str(scene_id))
+    return m.group(1) if m else "unknown"
+
+
+def band_diff_screen(
+    rdn: np.ndarray,
+    wl_nm: np.ndarray,
+    bm: np.ndarray,
+    *,
+    band_diff_min: float = BAND_DIFF_MIN_DEFAULT,
+    lo_nm: float = HFDI_LO_NM_DEFAULT,
+    hi_nm: float = HFDI_HI_NM_DEFAULT,
+    band_distance_max_nm: float = HFDI_BAND_DISTANCE_MAX_NM,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pre-fit fire screen on the absolute band difference. AVIRIS-5 only.
+
+    Keeps a pixel when L(hi) - L(lo) > band_diff_min. Returns
+    (keep_flat, hfdi_flat); hfdi is still returned for the caller's
+    diagnostics but does not gate anything.
+
+    HFDI is not used because it divides by (L_hi + L_lo), making it
+    (r-1)/(r+1) for r = L_hi/L_lo, so it carries no magnitude. A bright flat
+    cloud has L_lo = L_hi, scores 0.00 and clears a -0.1 threshold with
+    nothing burning. On an AVIRIS-5 line over pyrocumulus that flagged
+    277,281 pixels; the band difference gives 3,430.
+
+    There is no saturation auto-pass. The one in hfdi_screen tests two single
+    bands, so one bad detector pixel flags a whole column (11,061 pixels of
+    vertical stripes on the same line). A fire that saturates 2430 nm has a
+    large band difference and is kept on the primary test.
+
+    AVIRIS-3 is unaffected: process_scene dispatches on the scene id.
+    """
+    n_bands = int(np.asarray(wl_nm).size)
+    rdn2 = np.asarray(rdn, dtype=np.float32).reshape(-1, n_bands)
+
+    hfdi, (lo_idx, lo_act), (hi_idx, hi_act) = compute_hfdi(
+        rdn, wl_nm, lo_nm=lo_nm, hi_nm=hi_nm)
+
+    d_lo, d_hi = abs(lo_act - float(lo_nm)), abs(hi_act - float(hi_nm))
+    if d_lo > float(band_distance_max_nm) or d_hi > float(band_distance_max_nm):
+        if verbose:
+            print(f"[screen] WARNING: nearest sensor bands are far from the "
+                  f"index targets ({lo_nm:.1f} -> {lo_act:.2f}, d={d_lo:.2f}; "
+                  f"{hi_nm:.1f} -> {hi_act:.2f}, d={d_hi:.2f}); screen "
+                  f"DISABLED for this scene.")
+        return np.ones(hfdi.shape, dtype=bool), hfdi
+
+    band_diff = (rdn2[:, hi_idx].astype(np.float64)
+                 - rdn2[:, lo_idx].astype(np.float64))
+    keep = np.isfinite(band_diff) & (band_diff > float(band_diff_min))
+
+    if verbose:
+        n = int(band_diff.size)
+        print(f"[screen] band difference L({hi_act:.2f}) - L({lo_act:.2f}) > "
+              f"{band_diff_min:g}")
+        print(f"[screen]   kept {int(keep.sum()):,} / {n:,} "
+              f"({100.0 * keep.sum() / max(n, 1):.3f}%)")
+        if keep.any():
+            print(f"[screen]   kept: median diff "
+                  f"{np.median(band_diff[keep]):.3f}, median HFDI "
+                  f"{np.nanmedian(hfdi[keep]):.3f}")
+        # What the legacy HFDI screen would have kept, for comparison.
+        n_hfdi = int(np.nansum(hfdi > HFDI_MIN_DEFAULT))
+        print(f"[screen]   for reference, HFDI > {HFDI_MIN_DEFAULT} would keep "
+              f"{n_hfdi:,}")
+    return keep, hfdi
 
 
 def hfdi_screen(
@@ -461,10 +572,11 @@ def hfdi_screen(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Pre-fit fire screen. Returns (keep_flat, hfdi_flat), both (n_pix,).
 
-    A pixel is kept when ``HFDI > hfdi_min``; saturation in either index band
-    auto-passes, since clipped radiance makes HFDI meaningless and a pixel
-    saturating at 2430 nm is a strong fire candidate. If either target is further
-    than ``band_distance_max_nm`` from the nearest band the screen is disabled.
+    Keeps a pixel when ``HFDI > hfdi_min``. Saturation in either index band
+    auto-passes: clipped radiance makes HFDI meaningless, and a pixel saturating
+    at 2430 nm is a strong fire candidate that must not be dropped on a bad
+    number. If either target is further than ``band_distance_max_nm`` from the
+    nearest band, the screen is disabled and everything kept.
     """
     n_bands = int(np.asarray(wl_nm).size)
     hfdi, (lo_idx, lo_act), (hi_idx, hi_act) = compute_hfdi(
@@ -502,14 +614,15 @@ def hfdi_screen(
     return keep, hfdi
 
 
-# FRP retrieval (NGBoost on the forward-modeled emissive radiance)
+# FRP retrieval (NGBoost on the forward-modeled emissive radiance) -----------
 
 def load_frp_model(model_path: str):
     """Load a pickled NGBoost regressor from a joblib file.
 
     Unpickling reconstructs the estimator, so ngboost and the scikit-learn/scipy
-    versions it was pickled against must be importable here; version skew raises,
-    and the caller disables FRP for the run.
+    versions it was pickled against must be importable here. Version skew shows
+    up as an AttributeError or ModuleNotFoundError; the caller catches it and
+    disables FRP for the run.
     """
     if not model_path or not os.path.exists(model_path):
         raise FileNotFoundError(f"FRP model not found: {model_path!r}")
@@ -548,8 +661,9 @@ def transm_up_table(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Quantize H2OSTR and return (table, index) for upwelling transmittance.
 
-    Per-pixel transmittance is ``table[index]``, avoiding an (n_pix, bands)
-    array, and the quantization step matches the one the retrieval used.
+    ``table`` is (n_unique, bands), ``index`` is (n_pix,), so per-pixel
+    transmittance is ``table[index]`` with no (n_pix, bands) array. Uses the
+    retrieval's quantization step, so this is the transmittance the fit saw.
     """
     step = float(max(wv_quant_step, 1e-6))
     wv = np.asarray(wv, dtype=np.float32)
@@ -585,9 +699,18 @@ def forward_emissive_radiance(
     """Rebuild the forward model's emissive-radiance term, per pixel.
 
     Same math as ``retrieval._step2_forward``: moment-match the mixture to a
-    single Gaussian, integrate Planck against it and scale by alpha2. Pass
-    ``transm_table`` and ``transm_index`` for the at-sensor thermal term, or omit
-    them for surface-level radiance; returns (n_pix, bands) in uW/cm^2/sr/nm.
+    single Gaussian over ``cfg.T_grid``, integrate Planck against it with the
+    trapezoid weights ``cfg.w_T``, scale by alpha2. Pass ``transm_table`` and
+    ``transm_index`` for the at-sensor thermal term
+    (``alpha2 * E[B(T)] * transm_up``), the quantity the fit adds to the solar
+    baseline; omit them for surface-level radiance.
+
+    sigma_single is recomputed from the components, not read off ``sigma_map``:
+    the saved sigma is the inflated posterior
+    ``sigma_single * (1 + alpha_tuning * alpha2)``, which the forward model
+    never used, and would widen the pdf and bias the radiance.
+
+    Returns (n_pix, bands) float32 in uW/cm^2/sr/nm, matching the L1B cube.
     """
     mu_hot = np.asarray(mu_hot, dtype=np.float32).reshape(-1)
     sigma_hot = np.asarray(sigma_hot, dtype=np.float32).reshape(-1)
@@ -600,7 +723,7 @@ def forward_emissive_radiance(
     n_bands = int(np.asarray(wl_nm).size)
     T = np.asarray(cfg.T_grid, dtype=np.float32)
     wT = np.asarray(cfg.w_T, dtype=np.float32)
-    # Fold the quadrature weights into Planck once: (p_T * w_T) @ planck.
+    """Fold the quadrature weights into Planck once: (p_T * w_T) @ planck."""
     wplanck = _planck_grid(wl_nm, T) * wT[:, None]
 
     out = np.empty((n_pix, n_bands), dtype=np.float32)
@@ -609,8 +732,6 @@ def forward_emissive_radiance(
         i1 = min(n_pix, i0 + bs)
         e_b = eta[i0:i1]
         mu_s = e_b * mu_hot[i0:i1] + (1.0 - e_b) * mu_smol[i0:i1]
-        # sigma_single is recomputed from the components rather than read off
-        # sigma_map, which is the inflated posterior the forward model never used.
         var_s = (
             e_b * sigma_hot[i0:i1] ** 2
             + (1.0 - e_b) * sigma_smol[i0:i1] ** 2
@@ -627,21 +748,21 @@ def forward_emissive_radiance(
     return out
 
 
-# FRPD model feature spec, from the model handoff notebook. Order is load
-# bearing: the seven base bands, then for each pair in ``combinations`` order the
-# sum, difference, ratio and normalized difference.
+"""FRPD model feature spec, from the model handoff notebook. Order is load
+bearing: the seven base bands, then for each pair in ``combinations`` order the
+sum, difference, ratio, and normalized difference."""
 FRP_TARGET_BANDS_NM = (1025.0, 1200.0, 1550.0, 1700.0, 2100.0, 2260.0, 2360.0)
 
-# Emitted radiance leaves forward_emissive_radiance in uW/cm^2/sr/nm; the model
-# was trained in W/m^2/sr/um, which differs by exactly this factor.
+"""Emitted radiance leaves forward_emissive_radiance in uW/cm^2/sr/nm; the model
+was trained in W/m^2/sr/um. The two differ by exactly this factor."""
 FRP_RDN_UNIT_SCALE = 10.0
 
-# AVIRIS-3 instantaneous field of view, radians. Pixel area is
-# (IFOV * path_length)^2, which converts FRPD (W/m^2) to FRP (W).
+"""AVIRIS-3 instantaneous field of view, radians. Pixel area is
+(IFOV * path_length)^2, which converts FRPD (W/m^2) to FRP (W)."""
 FRP_IFOV_RAD = 0.56e-3
 
-# Nearest band must land within this distance of each target, else the model is
-# being fed the wrong part of the spectrum and FRP is skipped.
+"""Nearest band must land within this distance of each target, else the model is
+being fed the wrong part of the spectrum and FRP is skipped."""
 FRP_BAND_DISTANCE_MAX_NM = 15.0
 
 
@@ -667,10 +788,13 @@ def build_frp_features(
 ) -> Tuple[np.ndarray, List[str]]:
     """Build the (n_pix, 91) FRPD feature matrix from emitted radiance.
 
-    Selects the sensor band nearest each target, scales to the model's units and
-    emits the base bands followed by the four pairwise derived features per pair;
-    division by zero becomes NaN, which the base learner handles natively. Raises
-    if any target has no sensor band within ``band_distance_max_nm``.
+    Selects the sensor band nearest each target, scales to the model's units,
+    then emits the base bands followed by the four pairwise derived features per
+    pair. Division by zero becomes NaN, which the HistGradientBoosting base
+    learner handles natively.
+
+    ``emissive_rdn`` is (n_pix, bands) in uW/cm^2/sr/nm. Raises if any target
+    has no sensor band within ``band_distance_max_nm``.
     """
     from itertools import combinations
 
@@ -726,9 +850,10 @@ def pixel_area_m2(
 ) -> np.ndarray:
     """Per-pixel ground area in m^2 from the OBS path length.
 
-    OBS band 0 is path length in meters, pixel size is ``ifov_rad *
-    path_length``, and area is its square. Non-finite or non-positive path
-    lengths yield NaN, which drops those pixels from FRP.
+    OBS band 0 is path length in meters (the same band airborne.py adds to the
+    LOC ground elevation to recover sensor altitude). Pixel size is
+    ``ifov_rad * path_length``; area is its square. Non-finite or non-positive
+    path lengths yield NaN, which drops those pixels from FRP.
     """
     obs = np.asarray(obs_full)
     if obs.ndim != 3 or obs.shape[2] <= int(path_length_band):
@@ -744,8 +869,8 @@ def pixel_area_m2(
 def _ngboost_loc_scale(dist) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Pull (loc, scale) out of an NGBoost predicted distribution.
 
-    Tries the params dict, then attributes, then ``mean()``; ``scale`` is None
-    when the distribution has no spread parameter.
+    Tries the params dict (Normal -> {'loc', 'scale'}), then attributes, then
+    ``mean()``. ``scale`` is None when the distribution has no spread parameter.
     """
     params = getattr(dist, "params", None)
     if isinstance(params, dict):
@@ -783,11 +908,15 @@ def retrieve_frp(
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Predict per-pixel FRP with the NGBoost FRPD model.
 
-    The model returns power density in W/m^2; passing ``area_m2`` converts to FRP
-    in megawatts and scales the predicted sigma by the same linear factor.
-    Returns (frp_map, unc_map), both (rows, cols) float32 filled with
-    ``fill_value`` outside the retrieved set, with unc_map None for a
-    non-probabilistic model.
+    The model returns fire radiative power DENSITY in W/m^2. Passing
+    ``area_m2`` (per-pixel ground area, from :func:`pixel_area_m2`) converts to
+    FRP in megawatts; omit it to return FRPD unchanged. The predicted sigma
+    scales by the same factor, since area enters as a linear multiplier.
+
+    ``features`` is (n_retrieved, n_feat); ``valid_flat_idx`` maps those rows
+    back into the row-major flattened (rows, cols) grid. Returns (frp_map,
+    unc_map), both (rows, cols) float32 filled with ``fill_value`` outside the
+    retrieved set. ``unc_map`` is None for a non-probabilistic model.
     """
     X = np.asarray(features, dtype=np.float64)
     if X.ndim != 2:
@@ -799,8 +928,10 @@ def retrieve_frp(
             f"count ({idx.size})."
         )
 
-    # One pass over the ensemble, not two: pred_dist already carries the mean as
-    # its location parameter, so predict() is only the fallback.
+    """One pass over the ensemble, not two: pred_dist already carries the mean
+    as its location parameter, so calling predict() as well would double the
+    tree traversal -- the dominant cost of FRP on CPU. predict() is the
+    fallback only when the model exposes no distribution."""
     t_pred = time.perf_counter()
     loc, scale = None, None
     if hasattr(model, "pred_dist"):
@@ -819,8 +950,8 @@ def retrieve_frp(
             f"model returned {loc.size} predictions for {idx.size} pixels."
         )
 
-    # FRPD (W/m^2) -> FRP (MW). Pixels whose path length was unusable carry NaN
-    # area and drop out.
+    """FRPD (W/m^2) -> FRP (MW). Area is a linear factor, so sigma scales with
+    it; pixels whose path length was unusable carry NaN area and drop out."""
     unit = "FRPD (W/m^2)"
     if area_m2 is not None:
         a = np.asarray(area_m2, dtype=np.float64).reshape(-1)[idx]
@@ -832,7 +963,6 @@ def retrieve_frp(
     n_total = int(map_shape[0]) * int(map_shape[1])
 
     def _scatter(vals):
-        """Scatter per-pixel values back onto the (rows, cols) grid."""
         out = np.full((n_total,), np.float32(fill_value), dtype=np.float32)
         v = np.asarray(vals, dtype=np.float64)
         ok = np.isfinite(v)
@@ -866,9 +996,10 @@ def _write_frp_products(
 ) -> None:
     """Write the fireFRP / fireFRPUnc ENVI pair.
 
-    Shared by the normal and no-fire paths so a quiet scene yields the same four
-    products as a burning one; ``frp_unc_map`` of None writes an all-fill sigma
-    rather than omitting the file.
+    Shared by the normal path and the no-fire path so a quiet scene yields the
+    same four products as a burning one. ``frp_unc_map`` of None means the model
+    is not probabilistic, in which case an all-fill sigma is written rather than
+    omitting the file, keeping the product set fixed.
     """
     bin_path, _ = write_envi_single_band(
         output_stem(scene_id, "frp", args.to_ortho_dir), frp_map,
@@ -895,7 +1026,7 @@ def _write_frp_products(
     written["frp_unc"] = bin_path
 
 
-# Per-scene pipeline
+# Per-scene pipeline ---------------------------------------------------------
 
 def process_scene(
     scene_id: str,
@@ -907,8 +1038,8 @@ def process_scene(
 ) -> Dict[str, str]:
     """Run the retrieval for one ready scene and write its pre-ortho ENVI products.
 
-    Returns a dict of product key -> binary path; raises if a required ENVI cube
-    is missing or malformed.
+    Returns a dict of product key -> binary path. Raises if a required ENVI cube
+    is missing or malformed (callers in run_watcher catch and log).
     """
     t_scene = time.perf_counter()
     print("")
@@ -926,8 +1057,9 @@ def process_scene(
         parsed = _parse_scene_id(os.path.basename(p))
         return parsed[0] if parsed else None
 
-    # Scene id, and with it the T<HHMMSS> stamp, comes verbatim from the RDN
-    # filename: no GLT 'description' lookup and no GPS/UTC conversion.
+    """Scene id, and with it the T<HHMMSS> stamp, comes verbatim from the RDN
+    filename. No GLT 'description' lookup and no GPS/UTC conversion: whatever
+    the flight computer stamped is what the products are named with."""
     scene_id_from_rdn = _scene_id_from_path(paths["rdn"])
     if scene_id_from_rdn is None:
         raise RuntimeError(
@@ -969,8 +1101,10 @@ def process_scene(
     wl_nm = _ensure_nm(np.array([float(x) for x in rdn_ds.metadata["wavelength"]],
                                 dtype=np.float64))
 
-    # FWHM source priority: the RDN header 'fwhm' field, else the
-    # --sensor_wl_fwhm .npz cache (interpolated if band counts differ), else error.
+    """FWHM source priority: the RDN header 'fwhm' field; else the
+    --sensor_wl_fwhm .npz cache, used directly when band counts match and
+    linearly interpolated otherwise; else error. Onboard AVIRIS-3 L1B headers
+    do not carry FWHM."""
     if "fwhm" in rdn_ds.metadata:
         fwhm_nm = _ensure_fwhm_nm(
             np.array([float(x) for x in rdn_ds.metadata["fwhm"]], dtype=np.float64),
@@ -992,8 +1126,9 @@ def process_scene(
             print(f"[spec] header lacks fwhm; cache shapes match, using cache "
                   f"directly: {wl_npz} ({fwhm_nm.size} bands)")
         else:
-            # np.interp needs ascending xp, which the hpc-derived cache is;
-            # out-of-range queries clip to endpoints, safe at ~1 nm offsets.
+            """np.interp needs ascending xp, which the hpc-derived cache is.
+            Out-of-range queries clip to endpoints, safe at the ~1 nm offsets
+            between the hpc and onboard grids."""
             fwhm_nm = np.interp(wl_nm, wl_cache_npz, fwhm_cache_npz)
             donor_max = float(np.abs(
                 wl_nm - wl_cache_npz[np.abs(wl_nm[:, None] - wl_cache_npz[None, :]).argmin(axis=1)]
@@ -1002,8 +1137,9 @@ def process_scene(
                   f"({wl_cache_npz.size} bands) onto header wl ({wl_nm.size} bands); "
                   f"max donor distance {donor_max:.3f} nm")
 
-    # FWHM/WL pairing sanity print. AVIRIS-3 fwhm is nearly uniform so pairing
-    # can't be verified rigorously, but this catches wrong units and unpairing.
+    """FWHM/WL pairing sanity print. AVIRIS-3 fwhm is nearly uniform so pairing
+    can't be verified rigorously, but endpoints and aggregate stats catch wrong
+    units, negatives, off-scale values, and unpairing."""
     _step_nm_med = float(np.median(np.abs(np.diff(wl_nm)))) if wl_nm.size >= 2 else 0.0
     _fwhm_min = float(np.min(fwhm_nm)); _fwhm_med = float(np.median(fwhm_nm))
     _fwhm_max = float(np.max(fwhm_nm))
@@ -1026,10 +1162,10 @@ def process_scene(
     for _w in _fwhm_warns:
         print(f"[spec] WARNING: {_w}")
 
-    # Onboard RDN headers list wavelengths SWIR-first, but downstream code assumes
-    # ascending, so reverse wl/fwhm, the radiance cube and the bandmask. A
-    # bit-packed bandmask is unpacked, reversed and repacked, since reversing
-    # whole bytes does not reverse the bits inside each byte.
+    """Onboard RDN headers list wavelengths SWIR-first; downstream code assumes
+    ascending. Reverse wl/fwhm, the radiance cube, and the bandmask. A
+    bit-packed bandmask is unpacked, reversed, and repacked, since reversing
+    whole bytes does not reverse the bits inside each byte."""
     if wl_nm.size >= 2 and wl_nm[0] > wl_nm[-1]:
         print(f"[spec] RDN bands stored in descending wavelength order "
               f"({wl_nm[0]:.2f} -> {wl_nm[-1]:.2f} nm); reversing band axis "
@@ -1059,8 +1195,10 @@ def process_scene(
     print(f"[geom] SZA={sza:.3f} deg  cos(SZA)={csza:.4f}  elev={elev_km:.3f} km  "
           f"alt={alt_km:.3f} km")
 
-    # Night decision. 6S is given a capped solar zenith either way, so a twilight
-    # or night scene cannot blow up the LUT build.
+    """Night decision. 6S is given a capped solar zenith either way, so a
+    twilight or night scene cannot blow up the LUT build; past
+    --night_sza_deg the scene is additionally treated as having no solar
+    path at all."""
     is_night = bool(args.night_mode) and sza > float(args.night_sza_deg)
     lut_sza = min(float(sza), float(args.max_lut_sza_deg))
     if lut_sza < float(sza):
@@ -1081,26 +1219,35 @@ def process_scene(
     from .rt import resample_spectrum
     solar_irr = resample_spectrum(irr, iwl, wl_nm, fwhm_nm).astype(np.float64)
     if is_night:
-        # mult = solar_irr / cos(SZA) / pi feeds _baseline_solar, so zeroing the
-        # irradiance makes the solar baseline identically 0 and only the thermal
-        # terms are fit.
+        """mult = solar_irr / cos(SZA) / pi feeds _baseline_solar, so zeroing
+        the irradiance makes the solar baseline identically 0 in both stages.
+        The surface endmember weights stop affecting the loss and stay at their
+        simplex initialization; only the thermal terms are fit."""
         solar_irr = np.zeros_like(solar_irr)
 
-    # Build or fetch the date-cached RTE; rte_builder owns the on-disk LUT subdir
-    # and releases it at watcher exit. A night scene's LUT is built at the capped
-    # solar zenith, so a 'NIGHT-<date>' cache key keeps it out of the daytime slot.
+    """Build or fetch the date-cached RTE. The returned dict is the per-pixel
+    lookup cache; rte_builder owns the on-disk LUT subdir and releases it at
+    watcher exit, not per scene."""
+    """A night scene's LUT is built at the capped solar zenith, so it must not
+    share the per-date cache slot with daytime scenes flown the same date --
+    otherwise whichever came first would hand its atmosphere to the other. The
+    builder keys on the date parsed from the scene id and falls back to the
+    whole string when that fails, so a 'NIGHT-<date>' id gives night scenes
+    their own per-date slot."""
     lut_key_id = scene_id
     if is_night:
-        m_date = re.match(r"AV3(\d{8})[tT]", str(scene_id))
+        m_date = re.match(r"AV[35](\d{8})[tT]", str(scene_id))
         lut_key_id = f"NIGHT-{m_date.group(1) if m_date else scene_id}"
     rte, _lut_subdir = rte_builder.build(
         lut_key_id, lut_sza, elev_km, alt_km, wl_nm, fwhm_nm
     )
 
     if is_night:
-        # The 940 nm band-depth retrieval reads reflected sunlight, and NaN water
-        # vapor is the retrieval's do-not-retrieve flag, so prefer the median
-        # carried from the last daylight scene and fall back to --night_water_vapor.
+        """The 940 nm band-depth retrieval reads reflected sunlight, so it
+        returns noise or NaN at night -- and NaN water vapor is the retrieval's
+        do-not-retrieve flag, which would empty the scene. Prefer the median
+        carried from the last daylight scene of this flight; fall back to
+        --night_water_vapor when the watcher started after dark."""
         carried = wv_carry.value if wv_carry is not None else None
         if carried is not None and np.isfinite(carried):
             wv_req, wv_src = float(carried), (
@@ -1169,17 +1316,31 @@ def process_scene(
     rdn = np.asarray(rdn_full, dtype=np.float32)
     bm_raw = np.asarray(bm_full, dtype=np.uint8)
 
-    # Pre-fit HFDI screen. Failing pixels are dropped by setting their water
-    # vapor to NaN, the retrieval's existing 'do not retrieve' channel, so they
-    # land in the products as --fill_value.
+    """Pre-fit HFDI screen. Failing pixels are dropped by setting their water
+    vapor to NaN, the retrieval's existing 'do not retrieve' channel, so
+    retrieval.py is untouched. Screened pixels never enter a batch's valid set
+    and land in the products as --fill_value."""
     if bool(args.hfdi_filter):
-        keep_flat, _hfdi = hfdi_screen(
-            rdn, wl_nm, bm_raw,
-            hfdi_min=float(args.hfdi_min),
-            lo_nm=float(args.hfdi_lo_nm),
-            hi_nm=float(args.hfdi_hi_nm),
-            verbose=True,
-        )
+        # AVIRIS-3 keeps hfdi_screen unchanged. AVIRIS-5 uses the
+        # absolute band difference: HFDI normalises magnitude away.
+        _inst = scene_instrument(scene_id)
+        if _inst == "AV5":
+            keep_flat, _hfdi = band_diff_screen(
+                rdn, wl_nm, bm_raw,
+                band_diff_min=float(getattr(args, "band_diff_min",
+                                            BAND_DIFF_MIN_DEFAULT)),
+                lo_nm=float(args.hfdi_lo_nm),
+                hi_nm=float(args.hfdi_hi_nm),
+                verbose=True,
+            )
+        else:
+            keep_flat, _hfdi = hfdi_screen(
+                rdn, wl_nm, bm_raw,
+                hfdi_min=float(args.hfdi_min),
+                lo_nm=float(args.hfdi_lo_nm),
+                hi_nm=float(args.hfdi_hi_nm),
+                verbose=True,
+            )
         n_before = int(np.isfinite(water).sum())
         water = np.where(keep_flat.reshape(water.shape), water,
                          np.float32(np.nan)).astype(np.float32)
@@ -1233,8 +1394,8 @@ def process_scene(
     qc_str = f"; band_diff_masked={n_qc}" if args.qc_band_diff_filter else ""
     print(f"[retrieval] valid pixels: {out['n_valid']} in {out['elapsed']:.2f}s{qc_str}")
 
-    # Per-scene stats over finite pixels only. mu_map is E[T] (K) and sigma_map
-    # the moment-matched single-Gaussian sigma_post (K).
+    """Per-scene stats over finite pixels only. mu_map is E[T] (K), sigma_map
+    the moment-matched single-Gaussian sigma_post (K)."""
     mu_arr = np.asarray(out["mu_map"], dtype=np.float32)
     sigma_arr = np.asarray(out["sigma_map"], dtype=np.float32)
     mu_finite = np.isfinite(mu_arr)
@@ -1254,8 +1415,9 @@ def process_scene(
     else:
         print("[stats] no finite E[T] pixels in this scene")
 
-    # Products are written unwarped, in raw (line, sample) geometry, so the ortho
-    # step can apply this scene's GLT directly.
+    """Products are written unwarped, in raw (line, sample) geometry, so the
+    ortho step can apply this scene's GLT directly. Non-retrieved pixels carry
+    --fill_value, echoed in the header as 'data ignore value'."""
     fill = float(args.fill_value)
     common_meta = {
         "scene id": scene_id,
@@ -1283,16 +1445,25 @@ def process_scene(
     )
     written["fire_temp_unc"] = bin_path
 
-    # Optional FRP product. The FRPD model consumes emitted radiance, rebuilt
-    # here from the retrieved mixture state; an FRP failure is logged and the
-    # temperature products still succeed.
+    """Optional FRP product. The FRPD model consumes emitted radiance, rebuilt
+    here from the retrieved mixture state for the same pixels the temperature
+    products cover. An FRP failure is logged; the temperature products still
+    succeed."""
+    # FRP is AVIRIS-3 only. The NGBoost model was trained on AVIRIS-3
+    # radiance and AVIRIS-5's response differs (FWHM ~5.8 vs ~7.4 nm).
+    if frp_model is not None and scene_instrument(scene_id) == "AV5":
+        print(f"[frp] skipping FRP for {scene_id}: the model is AVIRIS-3 only.")
+        frp_model = None
+
     if frp_model is not None:
         try:
             succ = np.asarray(out["success_map"], dtype=bool)
             idx = np.where(succ.reshape(-1))[0]
             if idx.size == 0:
-                # No fire in the scene is a valid result, so write all-fill
-                # products and keep the product set fixed for the ortho step.
+                """No fire in the scene is a valid result, not a failure. Write
+                all-fill products anyway so every scene yields the same four
+                files and the ortho step downstream never has to special-case a
+                quiet scene."""
                 print(f"[frp] no retrieved pixels in {scene_id}; writing "
                       f"all-fill FRP products ({fill:g}).")
                 frp_map = np.full(out["mu_map"].shape, np.float32(fill),
@@ -1335,8 +1506,8 @@ def process_scene(
                     verbose=True,
                 )
 
-                # Area from the OBS path length turns FRPD into FRP; skipped with
-                # --frp_density, which writes W/m^2 instead.
+                """Area from the OBS path length turns FRPD into FRP. Skipped
+                with --frp_density, which writes W/m^2 instead."""
                 area = None
                 if not bool(args.frp_density):
                     area = pixel_area_m2(
@@ -1372,7 +1543,7 @@ def process_scene(
     return written
 
 
-# Watcher
+# Watcher --------------------------------------------------------------------
 
 class SceneTimeout(RuntimeError):
     """Raised when a scene's required inputs never arrived in time."""
@@ -1381,9 +1552,10 @@ class SceneTimeout(RuntimeError):
 def run_watcher(args) -> dict:
     """Discover and process AV3 scenes from a single ``--input_dir``.
 
-    Polls every ``args.poll_seconds``, abandoning a scene still missing required
-    kinds ``args.scene_timeout_seconds`` after its first file appeared and, with
-    ``args.exit_on_timeout``, stopping. L1B inputs are never deleted.
+    Polls every ``args.poll_seconds``. A scene still missing required kinds
+    ``args.scene_timeout_seconds`` after its first file appeared is abandoned,
+    and with ``args.exit_on_timeout`` the watcher stops and exits nonzero. L1B
+    inputs are never deleted. Returns a summary dict.
     """
     for fld, lbl in [("fire_lib_csv", FIRE_LIB_FILENAME),
                      ("solar_irr_file", SOLAR_IRR_FILENAME)]:
@@ -1432,8 +1604,8 @@ def run_watcher(args) -> dict:
               f"swir1+swir2={args.eta_floor_swir1_and_swir2_sat:.2f})"
               f"{ceiling_note}")
 
-    # FRP model loaded once at startup; a load failure disables FRP for the run
-    # rather than killing the temperature products.
+    """FRP model loaded once at startup; a load failure disables FRP for the
+    run rather than killing the temperature products."""
     frp_model = None
     if getattr(args, "frp_model", None):
         try:
@@ -1443,8 +1615,8 @@ def run_watcher(args) -> dict:
                   f"({e!r}); FRP retrieval disabled for this run.")
             frp_model = None
 
-    # 6S LUTs are built once per calendar date and reused across every scene
-    # flown that date; see _RteBuilder.
+    """6S LUTs are built once per calendar date and reused across every scene
+    flown that date (see _RteBuilder)."""
     water_vapors = parse_water_vapors_csv(args.water_vapors)
     lut_root = _resolve_lut_dir(args.lut_dir)
     print(f"[rt] scratch LUT root: {lut_root}  (one LUT cached per calendar date)")
@@ -1456,8 +1628,9 @@ def run_watcher(args) -> dict:
         water_o3=float(args.water_o3),
     )
 
-    # Persisted beside the LUT scratch root, which is bound to real disk on the
-    # flight computer, so a restart after dark still finds the carried value.
+    """Persisted beside the LUT scratch root, which is bound to real disk on the
+    flight computer, so a watcher restarted after dark still finds the last
+    daylight scene's water vapor."""
     wv_carry_path = getattr(args, "wv_carry_file", None)
     if not wv_carry_path:
         wv_carry_path = os.path.join(
@@ -1486,7 +1659,7 @@ def run_watcher(args) -> dict:
                 settle_seconds=float(args.settle_seconds),
             )
 
-            # Start the timeout clock when a scene's first file shows up.
+            """Start the timeout clock when a scene's first file shows up."""
             for sid in list(ready) + list(partial):
                 first_seen.setdefault(sid, now)
 
@@ -1516,12 +1689,13 @@ def run_watcher(args) -> dict:
                                             wv_carry=wv_carry)
                     processed.append((scene_id, written))
                 except Exception as e:
-                    # One bad scene must not kill the watcher.
+                    """One bad scene must not kill the watcher."""
                     warnings.warn(f"scene {scene_id} failed: {e!r}", stacklevel=2)
                     failed.append((scene_id, repr(e)))
 
-            # Input-wait timeout: a scene partial for longer than
-            # --scene_timeout_seconds is abandoned and never retried.
+            """Input-wait timeout: a scene partial for longer than
+            --scene_timeout_seconds is abandoned and never retried, so files
+            landing later can't wake the watcher hours after the fact."""
             timed_out_ids = {s for s, _m, _a in timed_out}
             for sid in sorted(partial):
                 if sid in seen_scenes or sid in timed_out_ids:
@@ -1561,7 +1735,7 @@ def run_watcher(args) -> dict:
         print(f"[watch] STOPPING: {e}. Pass --no_exit_on_timeout to keep "
               f"polling after an incomplete scene.")
     finally:
-        # Single point where scratch disk is released.
+        """Single point where scratch disk is released."""
         rte_builder.cleanup()
 
     summary = dict(
@@ -1586,10 +1760,9 @@ def run_watcher(args) -> dict:
     return summary
 
 
-# Argparse + main entry
+# Argparse + main entry ------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the CLI parser for the onboard watcher."""
     p = argparse.ArgumentParser(
         description="AVIRIS-3 two-component Gaussian temperature retrieval "
                     "(onboard / pre-ortho entry point).",
@@ -1697,6 +1870,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Lower index wavelength (nm); nearest sensor band is used.")
     g_hfdi.add_argument("--hfdi_hi_nm", type=float, default=HFDI_HI_NM_DEFAULT,
                         help="Upper index wavelength (nm); nearest sensor band is used.")
+    g_hfdi.add_argument("--band_diff_min", type=float,
+                        default=BAND_DIFF_MIN_DEFAULT,
+                        help="AVIRIS-5 ONLY: keep a pixel when "
+                             "L(hi) - L(lo) exceeds this. AVIRIS-5 uses the "
+                             "absolute band difference instead of HFDI, which "
+                             "normalises magnitude away and lets bright flat "
+                             "cloud through. Ignored for AVIRIS-3.")
+    g_hfdi.add_argument("--require_chunk", action="store_true",
+                        help="Ignore scenes whose filename carries no _NNN "
+                             "chunk number. For the AVIRIS-5 cluster archive, "
+                             "whose unchunked full-line OBS/LOC/GLT have no "
+                             "matching RDN. Leave off for flight.")
     g_hfdi.add_argument("--hfdi_min", type=float, default=HFDI_MIN_DEFAULT,
                         help="Keep a pixel only if HFDI > this value.")
 

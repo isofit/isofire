@@ -634,10 +634,10 @@ def hfdi_screen(
 
 # Scene id from filename: AV3 base (date+time) plus an optional _NNN chunk, so
 # chunked and unchunked siblings stay distinct.
-_SCENE_RE = re.compile(r"^(AV3\d{8}[tT]\d{6})(?:_(\d{3,}))?")
+_SCENE_RE = re.compile(r"^(AV[35]\d{8}[tT]\d{6})(?:_(\d{3,}))?")
 
 # Free-text AV3 scene id search inside a GLT header 'description'.
-_GLT_DESC_SCENE_RE = re.compile(r"AV3\d{8}[tT]\d{6}(?:_\d{3,})?")
+_GLT_DESC_SCENE_RE = re.compile(r"AV[35]\d{8}[tT]\d{6}(?:_\d{3,})?")
 
 REQUIRED_KIND_KEYS = ("rdn", "loc", "glt", "mask", "obs")
 
@@ -849,7 +849,7 @@ class _RteBuilder:
         The separator is matched case-insensitively so hpc (GPS-time) and onboard
         (system-time) ids share a date key; falls back to the full scene_id.
         """
-        m = re.match(r"AV3(\d{8})[tT]", str(scene_id))
+        m = re.match(r"AV[35](\d{8})[tT]", str(scene_id))
         return m.group(1) if m else str(scene_id)
 
     @staticmethod
