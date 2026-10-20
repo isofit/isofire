@@ -11,8 +11,8 @@
 Flight-computer entry point. Reads one ``--input_dir`` holding ENVI files for
 one or more AVIRIS-3 or AVIRIS-5 scenes, grouped by scene id
 (``AV[35]<date><time>[_<chunk>]``). Behaviour differs by instrument in two
-places and nowhere else: AVIRIS-5 screens on the absolute band difference
-rather than HFDI, and FRP is skipped for AVIRIS-5 because the model is
+places and nowhere else: AVIRIS-5 screens on a wide-span normalised
+difference (1650/2430) plus windowed saturation rather than HFDI, and FRP is skipped for AVIRIS-5 because the model is
 AVIRIS-3 only. A
 scene is processed once its RDN, LOC, BANDMASK/sat and OBS ENVI pairs are all
 present. Products are written unwarped into ``--to_ortho_dir`` as ENVI pairs
@@ -484,7 +484,13 @@ def compute_hfdi(
     return hfdi.astype(np.float32), (lo_idx, lo_act), (hi_idx, hi_act)
 
 
-BAND_DIFF_MIN_DEFAULT = 0.15     # uW/cm^2/sr/nm, AVIRIS-5 only
+WIDE_LO_NM_DEFAULT = 1650.0      # AVIRIS-5 screen, SWIR1
+WIDE_HI_NM_DEFAULT = 2430.0      # AVIRIS-5 screen, SWIR2
+WIDE_INDEX_MIN_DEFAULT = -0.50
+SAT_LO_NM_DEFAULT = 2300.0
+SAT_HI_NM_DEFAULT = 2500.0
+SAT_MIN_FRAC_DEFAULT = 0.25
+SAT_BAD_COL_RATE_DEFAULT = 0.5
 
 
 def scene_instrument(scene_id: str) -> str:
@@ -493,42 +499,52 @@ def scene_instrument(scene_id: str) -> str:
     return m.group(1) if m else "unknown"
 
 
-def band_diff_screen(
+def wide_index_screen(
     rdn: np.ndarray,
     wl_nm: np.ndarray,
     bm: np.ndarray,
     *,
-    band_diff_min: float = BAND_DIFF_MIN_DEFAULT,
-    lo_nm: float = HFDI_LO_NM_DEFAULT,
-    hi_nm: float = HFDI_HI_NM_DEFAULT,
+    index_min: float = WIDE_INDEX_MIN_DEFAULT,
+    lo_nm: float = WIDE_LO_NM_DEFAULT,
+    hi_nm: float = WIDE_HI_NM_DEFAULT,
+    sat_lo_nm: float = SAT_LO_NM_DEFAULT,
+    sat_hi_nm: float = SAT_HI_NM_DEFAULT,
+    sat_min_frac: float = SAT_MIN_FRAC_DEFAULT,
+    sat_bad_col_rate: float = SAT_BAD_COL_RATE_DEFAULT,
     band_distance_max_nm: float = HFDI_BAND_DISTANCE_MAX_NM,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Pre-fit fire screen on the absolute band difference. AVIRIS-5 only.
+    """Pre-fit fire screen for AVIRIS-5. Returns (keep_flat, index_flat).
 
-    Keeps a pixel when L(hi) - L(lo) > band_diff_min. Returns
-    (keep_flat, hfdi_flat); hfdi is still returned for the caller's
-    diagnostics but does not gate anything.
+    Keeps a pixel when
 
-    HFDI is not used because it divides by (L_hi + L_lo), making it
-    (r-1)/(r+1) for r = L_hi/L_lo, so it carries no magnitude. A bright flat
-    cloud has L_lo = L_hi, scores 0.00 and clears a -0.1 threshold with
-    nothing burning. On an AVIRIS-5 line over pyrocumulus that flagged
-    277,281 pixels; the band difference gives 3,430.
+        (L_hi - L_lo) / (L_hi + L_lo) > index_min
 
-    There is no saturation auto-pass. The one in hfdi_screen tests two single
-    bands, so one bad detector pixel flags a whole column (11,061 pixels of
-    vertical stripes on the same line). A fire that saturates 2430 nm has a
-    large band difference and is kept on the primary test.
+    with lo = 1650 nm and hi = 2430 nm, OR when it is saturated over a SWIR2
+    window.
 
-    AVIRIS-3 is unaffected: process_scene dispatches on the scene id.
+    The same normalised-difference form as HFDI, on a wider band pair. HFDI
+    uses 2061/2430, both inside one atmospheric window, so a cloud is
+    spectrally flat across them and scores near zero with nothing burning: on
+    an AVIRIS-5 line over pyrocumulus that flagged 264,731 cloud pixels. Across
+    1650 to 2430, water and ice absorb strongly near 2.4 um, so cloud
+    reflectance falls while fire emission rises. Measured on that line, cloud
+    sits below -0.70 and fire above -0.50.
+
+    The saturation term exists because the index goes blind on the hottest
+    pixels: where the bands clip, the numerator collapses and a fire core reads
+    as background. It is tested over a window rather than one band, because a
+    single bad detector pixel flags an entire column under a single-band test,
+    and columns saturating on more than sat_bad_col_rate of their lines are
+    rejected as artifacts.
     """
-    n_bands = int(np.asarray(wl_nm).size)
+    wl = np.asarray(wl_nm, dtype=np.float64)
+    n_bands = int(wl.size)
+    shape2d = np.asarray(rdn).shape[:2]
     rdn2 = np.asarray(rdn, dtype=np.float32).reshape(-1, n_bands)
 
-    hfdi, (lo_idx, lo_act), (hi_idx, hi_act) = compute_hfdi(
-        rdn, wl_nm, lo_nm=lo_nm, hi_nm=hi_nm)
-
+    lo_idx, lo_act = _nearest_band(wl, lo_nm)
+    hi_idx, hi_act = _nearest_band(wl, hi_nm)
     d_lo, d_hi = abs(lo_act - float(lo_nm)), abs(hi_act - float(hi_nm))
     if d_lo > float(band_distance_max_nm) or d_hi > float(band_distance_max_nm):
         if verbose:
@@ -536,27 +552,56 @@ def band_diff_screen(
                   f"index targets ({lo_nm:.1f} -> {lo_act:.2f}, d={d_lo:.2f}; "
                   f"{hi_nm:.1f} -> {hi_act:.2f}, d={d_hi:.2f}); screen "
                   f"DISABLED for this scene.")
-        return np.ones(hfdi.shape, dtype=bool), hfdi
+        return np.ones(rdn2.shape[0], dtype=bool), np.full(rdn2.shape[0], np.nan)
 
-    band_diff = (rdn2[:, hi_idx].astype(np.float64)
-                 - rdn2[:, lo_idx].astype(np.float64))
-    keep = np.isfinite(band_diff) & (band_diff > float(band_diff_min))
+    L_lo = rdn2[:, lo_idx].astype(np.float64)
+    L_hi = rdn2[:, hi_idx].astype(np.float64)
+    denom = L_hi + L_lo
+    index = np.full(L_lo.shape, np.nan)
+    ok = np.isfinite(denom) & (np.abs(denom) > 1e-12)
+    index[ok] = (L_hi[ok] - L_lo[ok]) / denom[ok]
+    c_idx = np.isfinite(index) & (index > float(index_min))
+
+    c_sat = np.zeros_like(c_idx)
+    n_bad_col = 0
+    win = np.flatnonzero((wl >= float(sat_lo_nm)) & (wl <= float(sat_hi_nm)))
+    if win.size and bm is not None:
+        bm_flat = np.asarray(bm, dtype=np.uint8).reshape(c_idx.size, -1)
+        sat = np.stack([_band_saturated(bm_flat, n_bands, int(k)) for k in win],
+                       axis=-1)
+        c_sat = sat.mean(axis=-1) >= float(sat_min_frac)
+        # A dead column fires on nearly every line; a fire core does not.
+        if len(shape2d) == 2 and shape2d[0] * shape2d[1] == c_sat.size:
+            s2 = c_sat.reshape(shape2d)
+            bad = s2.mean(axis=0) > float(sat_bad_col_rate)
+            n_bad_col = int(bad.sum())
+            if n_bad_col:
+                c_sat = (s2 & ~bad[None, :]).reshape(-1)
+
+    keep = c_idx | c_sat
 
     if verbose:
-        n = int(band_diff.size)
-        print(f"[screen] band difference L({hi_act:.2f}) - L({lo_act:.2f}) > "
-              f"{band_diff_min:g}")
-        print(f"[screen]   kept {int(keep.sum()):,} / {n:,} "
+        n = int(c_idx.size)
+        print(f"[screen] (L{hi_act:.0f} - L{lo_act:.0f})/(L{hi_act:.0f} + "
+              f"L{lo_act:.0f}) > {index_min:g} OR saturated over "
+              f"{sat_lo_nm:.0f}-{sat_hi_nm:.0f} nm ({win.size} bands, "
+              f">= {sat_min_frac:.0%})")
+        print(f"[screen]   index      {int(c_idx.sum()):9,} / {n:,}")
+        print(f"[screen]   saturation {int(c_sat.sum()):9,}"
+              + (f"   ({n_bad_col} bad column(s) rejected)" if n_bad_col else ""))
+        print(f"[screen]   kept       {int(keep.sum()):9,} "
               f"({100.0 * keep.sum() / max(n, 1):.3f}%)")
-        if keep.any():
-            print(f"[screen]   kept: median diff "
-                  f"{np.median(band_diff[keep]):.3f}, median HFDI "
-                  f"{np.nanmedian(hfdi[keep]):.3f}")
+        print(f"[screen]   recovered by saturation: "
+              f"{int((c_sat & ~c_idx).sum()):,}")
         # What the legacy HFDI screen would have kept, for comparison.
-        n_hfdi = int(np.nansum(hfdi > HFDI_MIN_DEFAULT))
+        h_lo, _ = _nearest_band(wl, HFDI_LO_NM_DEFAULT)
+        h_hi, _ = _nearest_band(wl, HFDI_HI_NM_DEFAULT)
+        a, b = rdn2[:, h_lo].astype(np.float64), rdn2[:, h_hi].astype(np.float64)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            hf = (b - a) / (b + a)
         print(f"[screen]   for reference, HFDI > {HFDI_MIN_DEFAULT} would keep "
-              f"{n_hfdi:,}")
-    return keep, hfdi
+              f"{int(np.nansum(hf > HFDI_MIN_DEFAULT)):,}")
+    return keep, index
 
 
 def hfdi_screen(
@@ -1322,15 +1367,13 @@ def process_scene(
     and land in the products as --fill_value."""
     if bool(args.hfdi_filter):
         # AVIRIS-3 keeps hfdi_screen unchanged. AVIRIS-5 uses the
-        # absolute band difference: HFDI normalises magnitude away.
+        # 1650/2430 wide index plus windowed saturation.
         _inst = scene_instrument(scene_id)
         if _inst == "AV5":
-            keep_flat, _hfdi = band_diff_screen(
+            keep_flat, _hfdi = wide_index_screen(
                 rdn, wl_nm, bm_raw,
-                band_diff_min=float(getattr(args, "band_diff_min",
-                                            BAND_DIFF_MIN_DEFAULT)),
-                lo_nm=float(args.hfdi_lo_nm),
-                hi_nm=float(args.hfdi_hi_nm),
+                index_min=float(getattr(args, "wide_index_min",
+                                        WIDE_INDEX_MIN_DEFAULT)),
                 verbose=True,
             )
         else:
@@ -1870,13 +1913,14 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Lower index wavelength (nm); nearest sensor band is used.")
     g_hfdi.add_argument("--hfdi_hi_nm", type=float, default=HFDI_HI_NM_DEFAULT,
                         help="Upper index wavelength (nm); nearest sensor band is used.")
-    g_hfdi.add_argument("--band_diff_min", type=float,
-                        default=BAND_DIFF_MIN_DEFAULT,
+    g_hfdi.add_argument("--wide_index_min", type=float,
+                        default=WIDE_INDEX_MIN_DEFAULT,
                         help="AVIRIS-5 ONLY: keep a pixel when "
-                             "L(hi) - L(lo) exceeds this. AVIRIS-5 uses the "
-                             "absolute band difference instead of HFDI, which "
-                             "normalises magnitude away and lets bright flat "
-                             "cloud through. Ignored for AVIRIS-3.")
+                             "(L2430 - L1650)/(L2430 + L1650) exceeds this, or "
+                             "when it is saturated over 2300-2500 nm. The "
+                             "wide band pair separates cloud from fire where "
+                             "HFDI's 2061/2430 pair does not. Ignored for "
+                             "AVIRIS-3.")
     g_hfdi.add_argument("--require_chunk", action="store_true",
                         help="Ignore scenes whose filename carries no _NNN "
                              "chunk number. For the AVIRIS-5 cluster archive, "
