@@ -58,6 +58,9 @@ dependencies = [
     "ngboost>=0.5.11",
     "scikit-learn>=1.7.2",
     "joblib>=1.5.3",
+    "xarray>=2024.6",       # EMIT VSWIR LUT (spaceborne)
+    "zarr>=2.18",
+    "h5py>=3.11",           # EMIT netCDF inputs
 ]
 
 [project.optional-dependencies]
@@ -73,6 +76,7 @@ dev = [
 ]
 
 [project.scripts]
+isofire-spaceborne = "isofire.spaceborne:main"
 # `isofire-science` resolves to `isofire.airborne:main`.
 # Equivalent to: `python -m isofire.airborne ...`
 isofire-science = "isofire.airborne:main"
@@ -156,3 +160,8 @@ python_version = "3.10"
 ignore_missing_imports = true
 warn_unused_ignores = true
 mypy_path = "src"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
