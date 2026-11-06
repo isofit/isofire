@@ -119,6 +119,9 @@ from .retrieval import (
 )
 from .rt import resample_spectrum
 
+# Bands never fit, day or night: spectral ends and the 1.4 / 1.9 um water bands, matching the
+# gaps in the cover-class / specmix grid.
+SPACEBORNE_BAD_RANGES_NM = np.array([[0.0, 440.0], [1300.0, 1480.0], [1770.0, 2050.0], [2440.0, 9999.0]])
 FILL_NOT_RETRIEVED = -1.0    # in-scene, not retrieved (0 = out of swath in ortho)
 
 
@@ -340,11 +343,10 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     else:
         mode = args.mode
     print(f"[scene] median SZA {sza_med:.2f} deg -> {mode}")
-    # The PCA basis also defines the band set every fit uses, day and night: bands outside
-    # the cover-class/specmix grid (water-band edges, spectral ends) are fully masked, as in
-    # cover-class. Night needs no surface, but loads the basis for its band set when given.
     basis = None
-    if args.pca_basis:
+    if mode == "day":
+        if not args.pca_basis:
+            raise RuntimeError("day scene needs --pca_basis")
         key = f"{args.pca_basis}|{args.n_pc}|{wl.size}|{wl[0]:.3f}"
         if key not in basis_cache:
             basis_cache[key] = PCASurfaceBasis.from_npz(args.pca_basis, wl, n_pc=args.n_pc)
@@ -352,11 +354,6 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
             print(f"[pca] {Path(b.source).name}: {b.n_pc} PCs, approach {b.approach!r}, "
                   f"{b.grid_match}, {int(b.valid_1d.sum())}/{wl.size} bands defined")
         basis = basis_cache[key]
-    if mode == "day" and basis is None:
-        raise RuntimeError("day scene needs --pca_basis")
-    if basis is None:
-        print("[bands] WARNING: no --pca_basis, so night fits use every band outside the fixed bad "
-              "ranges, including the water-band edges; pass --pca_basis to use the cover-class band set")
 
     # ---- screen
     t_s = time.perf_counter()
@@ -458,17 +455,12 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
         print(f"[water] night: fixed H2OSTR {args.night_h2ostr} g/cm^2")
 
     # ---- windows and eta bounds
-    good = make_bitwise_bad_range_mask_1d(wl, BAD_RANGES_NM_DEFAULT)
+    good = make_bitwise_bad_range_mask_1d(wl, np.vstack([BAD_RANGES_NM_DEFAULT, SPACEBORNE_BAD_RANGES_NM]))
     surface_1d = good & ranges_to_mask(wl, _parse_ranges(args.surface_window_ranges_nm, SURFACE_RANGES_NM_DEFAULT))
     hot_1d = good & ranges_to_mask(wl, _parse_ranges(args.hot_window_ranges_nm, HOT_RANGES_NM_DEFAULT))
     smol_1d = good & ranges_to_mask(wl, _parse_ranges(args.smolder_window_ranges_nm, SMOLDER_RANGES_NM_DEFAULT))
-    if basis is not None:
-        surface_1d &= basis.valid_1d
-        hot_1d &= basis.valid_1d
-        smol_1d &= basis.valid_1d
-        print(f"[bands] fit bands (cover-class set & window & not bad): surface {int(surface_1d.sum())}, "
-              f"hot {int(hot_1d.sum())}, smoulder {int(smol_1d.sum())}; bandmask-flagged bands are "
-              f"removed per pixel on top")
+    print(f"[bands] fit bands (outside {SPACEBORNE_BAD_RANGES_NM.tolist()}): surface {int(surface_1d.sum())}, "
+          f"hot {int(hot_1d.sum())}, smoulder {int(smol_1d.sum())}; bandmask-flagged bands removed per pixel")
     swir2_1d = ranges_to_mask(wl, np.array([[args.eta_swir2_lo_nm, args.eta_swir2_hi_nm]]))
     swir1_1d = ranges_to_mask(wl, ETA_SWIR1_OVERRIDE_RANGES_NM_DEFAULT)
     sat2, sat1, eta_lo, eta_hi = eta_bounds_from_saturation(
@@ -516,7 +508,7 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     mu0 = np.cos(np.deg2rad(np.where(np.isfinite(sza_px), sza_px, sza))).astype(np.float32)
     res = run_pca_fire_retrieval(
         obs_px, wv_px, sat_ok, cfg=cfg, rte=rte, solar_irr=solar_irr, mu0=mu0, wl_nm=wl,
-        basis=basis if mode == "day" else None, surface_1d=surface_1d, hot_1d=hot_1d, smolder_1d=smol_1d,
+        basis=basis, surface_1d=surface_1d, hot_1d=hot_1d, smolder_1d=smol_1d,
         eta_lo=eta_lo, eta_hi=eta_hi, include_solar=not night,
         solar_scaling=args.solar_scaling, T1_init=T1_init, log_alpha1_init=la1_init,
         log_alpha_min=args.log_alpha_min, log_alpha_max=args.log_alpha_max,
@@ -611,8 +603,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("PCA surface (day)")
     g.add_argument("--pca_basis", default=None,
-                   help="pca_surface_*.npz from the specmix notebook; required by day, and at night it "
-                        "sets the fit band set (bands outside the cover-class grid are fully masked)")
+                   help="pca_surface_*.npz from the specmix notebook (day only)")
     g.add_argument("--n_pc", type=int, default=8)
     g.add_argument("--pca_prior_weight", type=float, default=1.0, help="weight on the N(0,I) whitened-score prior")
     g.add_argument("--rfl_bounds_weight", type=float, default=1.0e4, help="penalty on reflectance outside [0,1]")
