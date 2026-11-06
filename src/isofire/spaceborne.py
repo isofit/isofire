@@ -119,8 +119,11 @@ from .retrieval import (
 )
 from .rt import resample_spectrum
 
-FILL_NOT_RETRIEVED = -1.0
-FULL_RANGE_NM = np.array([[350.0, 2500.0]])    # in-scene, not retrieved (0 = out of swath in ortho)
+FILL_NOT_RETRIEVED = -1.0    # in-scene, not retrieved (0 = out of swath in ortho)
+FULL_RANGE_NM = np.array([[350.0, 2500.0]])
+# EMIT order-sorting-filter seams: a few bands whose L1B radiance spikes with random sign.
+# Removed from every fit, day and night, on top of the cover-class band set.
+OSF_SEAMS_NM = np.array([[1280.0, 1310.0], [1495.0, 1525.0]])
 
 
 # --------------------------------------------------------------- helpers
@@ -354,6 +357,10 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
               f"{b.grid_match}, {int(b.valid_1d.sum())}/{wl.size} bands defined")
     basis = basis_cache[key]
     band_set = basis.valid_1d.copy()
+    seams = ranges_to_mask(wl, _parse_ranges(args.exclude_ranges_nm, OSF_SEAMS_NM))
+    print(f"[bands] cover-class set {int(band_set.sum())} bands; excluding {int((band_set & seams).sum())} "
+          f"order-sorting-filter seam bands at {wl[band_set & seams].round(1).tolist()}")
+    band_set &= ~seams
 
     # ---- screen
     t_s = time.perf_counter()
@@ -458,7 +465,7 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     surface_1d = band_set & ranges_to_mask(wl, _parse_ranges(args.surface_window_ranges_nm, FULL_RANGE_NM))
     hot_1d = band_set & ranges_to_mask(wl, _parse_ranges(args.hot_window_ranges_nm, FULL_RANGE_NM))
     smol_1d = band_set & ranges_to_mask(wl, _parse_ranges(args.smolder_window_ranges_nm, FULL_RANGE_NM))
-    print(f"[bands] fit band set: {int(band_set.sum())} cover-class bands "
+    print(f"[bands] fit band set: {int(band_set.sum())} bands (cover-class minus seams) "
           f"({wl[band_set].min():.1f}-{wl[band_set].max():.1f} nm); windows keep surface "
           f"{int(surface_1d.sum())}, hot {int(hot_1d.sum())}, smoulder {int(smol_1d.sum())}; "
           f"bandmask-flagged bands removed per pixel")
@@ -640,6 +647,8 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--noise_floor", type=float, default=0.005, help="uW/cm^2/sr/nm")
 
     g = p.add_argument_group("windows")
+    g.add_argument("--exclude_ranges_nm", default=str(OSF_SEAMS_NM.tolist()),
+                   help="bands removed from every fit on top of the cover-class set (EMIT OSF seams)")
     g.add_argument("--surface_window_ranges_nm", default=str(FULL_RANGE_NM.tolist()))
     g.add_argument("--hot_window_ranges_nm", default=str(FULL_RANGE_NM.tolist()))
     g.add_argument("--smolder_window_ranges_nm", default=str(FULL_RANGE_NM.tolist()))
