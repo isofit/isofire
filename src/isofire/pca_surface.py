@@ -133,11 +133,23 @@ class PCASurfaceBasis:
         comp, pm, pc = comp[:n], pm[:n], np.atleast_2d(pc)[:n, :n]
         good = good & np.isfinite(mean) & np.isfinite(comp).all(axis=0)
 
+        near = np.abs(wl_nm[:, None] - src_wl[None, :]).argmin(axis=0)       # sensor band per source band
+        exact = np.abs(wl_nm[near] - src_wl) < 0.5
         if src_wl.size == wl_nm.size and np.nanmax(np.abs(src_wl - wl_nm)) < 0.5:
             valid = good.copy()
             mean_t = np.where(valid, mean, 0.0)
             comp_t = np.where(valid[None, :], comp, 0.0)
             how = "same grid"
+        elif exact.all() and np.unique(near).size == near.size:
+            # source grid is a subset of the sensor bands (the specmix grid drops the water
+            # bands and the spectral ends): map band for band, nothing interpolated
+            valid = np.zeros(wl_nm.size, bool)
+            valid[near[good]] = True
+            mean_t = np.zeros(wl_nm.size)
+            comp_t = np.zeros((comp.shape[0], wl_nm.size))
+            mean_t[near[good]] = mean[good]
+            comp_t[:, near[good]] = comp[:, good]
+            how = f"subset of sensor grid ({int(good.sum())} of {wl_nm.size} bands)"
         else:
             sw = src_wl[good]
             o = np.argsort(sw)

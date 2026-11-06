@@ -119,10 +119,8 @@ from .retrieval import (
 )
 from .rt import resample_spectrum
 
-# Bands never fit, day or night: spectral ends and the 1.4 / 1.9 um water bands, matching the
-# gaps in the cover-class / specmix grid.
-SPACEBORNE_BAD_RANGES_NM = np.array([[0.0, 440.0], [1300.0, 1480.0], [1770.0, 2050.0], [2440.0, 9999.0]])
-FILL_NOT_RETRIEVED = -1.0    # in-scene, not retrieved (0 = out of swath in ortho)
+FILL_NOT_RETRIEVED = -1.0
+FULL_RANGE_NM = np.array([[350.0, 2500.0]])    # in-scene, not retrieved (0 = out of swath in ortho)
 
 
 # --------------------------------------------------------------- helpers
@@ -343,17 +341,19 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     else:
         mode = args.mode
     print(f"[scene] median SZA {sza_med:.2f} deg -> {mode}")
-    basis = None
-    if mode == "day":
-        if not args.pca_basis:
-            raise RuntimeError("day scene needs --pca_basis")
-        key = f"{args.pca_basis}|{args.n_pc}|{wl.size}|{wl[0]:.3f}"
-        if key not in basis_cache:
-            basis_cache[key] = PCASurfaceBasis.from_npz(args.pca_basis, wl, n_pc=args.n_pc)
-            b = basis_cache[key]
-            print(f"[pca] {Path(b.source).name}: {b.n_pc} PCs, approach {b.approach!r}, "
-                  f"{b.grid_match}, {int(b.valid_1d.sum())}/{wl.size} bands defined")
-        basis = basis_cache[key]
+    # The cover-class npz defines the only band set any fit uses, day and night: its good
+    # bands (207 for the specmix grid), minus each pixel's bandmask-flagged bands. Night loads
+    # it for the band set alone; only day uses the surface model.
+    if not args.pca_basis:
+        raise RuntimeError("--pca_basis is required: it defines the band set for every fit")
+    key = f"{args.pca_basis}|{args.n_pc}|{wl.size}|{wl[0]:.3f}"
+    if key not in basis_cache:
+        basis_cache[key] = PCASurfaceBasis.from_npz(args.pca_basis, wl, n_pc=args.n_pc)
+        b = basis_cache[key]
+        print(f"[pca] {Path(b.source).name}: {b.n_pc} PCs, approach {b.approach!r}, "
+              f"{b.grid_match}, {int(b.valid_1d.sum())}/{wl.size} bands defined")
+    basis = basis_cache[key]
+    band_set = basis.valid_1d.copy()
 
     # ---- screen
     t_s = time.perf_counter()
@@ -455,12 +455,13 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
         print(f"[water] night: fixed H2OSTR {args.night_h2ostr} g/cm^2")
 
     # ---- windows and eta bounds
-    good = make_bitwise_bad_range_mask_1d(wl, np.vstack([BAD_RANGES_NM_DEFAULT, SPACEBORNE_BAD_RANGES_NM]))
-    surface_1d = good & ranges_to_mask(wl, _parse_ranges(args.surface_window_ranges_nm, SURFACE_RANGES_NM_DEFAULT))
-    hot_1d = good & ranges_to_mask(wl, _parse_ranges(args.hot_window_ranges_nm, HOT_RANGES_NM_DEFAULT))
-    smol_1d = good & ranges_to_mask(wl, _parse_ranges(args.smolder_window_ranges_nm, SMOLDER_RANGES_NM_DEFAULT))
-    print(f"[bands] fit bands (outside {SPACEBORNE_BAD_RANGES_NM.tolist()}): surface {int(surface_1d.sum())}, "
-          f"hot {int(hot_1d.sum())}, smoulder {int(smol_1d.sum())}; bandmask-flagged bands removed per pixel")
+    surface_1d = band_set & ranges_to_mask(wl, _parse_ranges(args.surface_window_ranges_nm, FULL_RANGE_NM))
+    hot_1d = band_set & ranges_to_mask(wl, _parse_ranges(args.hot_window_ranges_nm, FULL_RANGE_NM))
+    smol_1d = band_set & ranges_to_mask(wl, _parse_ranges(args.smolder_window_ranges_nm, FULL_RANGE_NM))
+    print(f"[bands] fit band set: {int(band_set.sum())} cover-class bands "
+          f"({wl[band_set].min():.1f}-{wl[band_set].max():.1f} nm); windows keep surface "
+          f"{int(surface_1d.sum())}, hot {int(hot_1d.sum())}, smoulder {int(smol_1d.sum())}; "
+          f"bandmask-flagged bands removed per pixel")
     swir2_1d = ranges_to_mask(wl, np.array([[args.eta_swir2_lo_nm, args.eta_swir2_hi_nm]]))
     swir1_1d = ranges_to_mask(wl, ETA_SWIR1_OVERRIDE_RANGES_NM_DEFAULT)
     sat2, sat1, eta_lo, eta_hi = eta_bounds_from_saturation(
@@ -508,7 +509,7 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     mu0 = np.cos(np.deg2rad(np.where(np.isfinite(sza_px), sza_px, sza))).astype(np.float32)
     res = run_pca_fire_retrieval(
         obs_px, wv_px, sat_ok, cfg=cfg, rte=rte, solar_irr=solar_irr, mu0=mu0, wl_nm=wl,
-        basis=basis, surface_1d=surface_1d, hot_1d=hot_1d, smolder_1d=smol_1d,
+        basis=basis if mode == "day" else None, surface_1d=surface_1d, hot_1d=hot_1d, smolder_1d=smol_1d,
         eta_lo=eta_lo, eta_hi=eta_hi, include_solar=not night,
         solar_scaling=args.solar_scaling, T1_init=T1_init, log_alpha1_init=la1_init,
         log_alpha_min=args.log_alpha_min, log_alpha_max=args.log_alpha_max,
@@ -603,7 +604,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("PCA surface (day)")
     g.add_argument("--pca_basis", default=None,
-                   help="pca_surface_*.npz from the specmix notebook (day only)")
+                   help="pca_surface_*.npz from the specmix notebook; required in every mode: its good bands "
+                        "are the only bands any fit uses (plus the per-pixel bandmask)")
     g.add_argument("--n_pc", type=int, default=8)
     g.add_argument("--pca_prior_weight", type=float, default=1.0, help="weight on the N(0,I) whitened-score prior")
     g.add_argument("--rfl_bounds_weight", type=float, default=1.0e4, help="penalty on reflectance outside [0,1]")
@@ -638,9 +640,9 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--noise_floor", type=float, default=0.005, help="uW/cm^2/sr/nm")
 
     g = p.add_argument_group("windows")
-    g.add_argument("--surface_window_ranges_nm", default=str(SURFACE_RANGES_NM_DEFAULT.tolist()))
-    g.add_argument("--hot_window_ranges_nm", default=str(HOT_RANGES_NM_DEFAULT.tolist()))
-    g.add_argument("--smolder_window_ranges_nm", default=str(SMOLDER_RANGES_NM_DEFAULT.tolist()))
+    g.add_argument("--surface_window_ranges_nm", default=str(FULL_RANGE_NM.tolist()))
+    g.add_argument("--hot_window_ranges_nm", default=str(FULL_RANGE_NM.tolist()))
+    g.add_argument("--smolder_window_ranges_nm", default=str(FULL_RANGE_NM.tolist()))
     g.add_argument("--eta_swir2_lo_nm", type=float, default=ETA_SWIR2_DEFAULT_NM[0])
     g.add_argument("--eta_swir2_hi_nm", type=float, default=ETA_SWIR2_DEFAULT_NM[1])
 
