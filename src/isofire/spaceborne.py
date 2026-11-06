@@ -258,7 +258,11 @@ def night_screen(rad, wl, bm, args):
     keep = np.isfinite(gate) & (gate >= args.night_gate_thr) & np.isfinite(ratio) & (ratio >= args.night_ratio_thr)
     n_sat = 0
     if bm is not None:
-        sat = _sat_map(bm, wl.size, gi) | _sat_map(bm, wl.size, hi)
+        # Saturation overrides only the ratio test, never the radiance gate: the
+        # EMIT bandmask flags whole lines that are not hot (seen as ~10240 extra
+        # px per scene), and a truly saturated fire is far above the gate anyway.
+        sat = (_sat_map(bm, wl.size, gi) | _sat_map(bm, wl.size, hi)) \
+            & np.isfinite(gate) & (gate >= args.night_gate_thr)
         n_sat = int((sat & ~keep).sum())
         keep |= sat
     info = dict(metric=f"L{hwl:.0f}/L{lwl:.0f}", gate_band_nm=gwl, ratio_hi_nm=hwl, ratio_lo_nm=lwl,
@@ -283,7 +287,9 @@ def day_screen(rad, wl, bm, args):
         keep |= extra
     n_sat = 0
     if bm is not None:
-        sat = _sat_map(bm, wl.size, lo) | _sat_map(bm, wl.size, hi)
+        # as at night: saturation passes only pixels that are also bright at 2430 nm
+        bright = np.isfinite(L_hi) & (L_hi > np.nanpercentile(L_hi, 99.5))
+        sat = (_sat_map(bm, wl.size, lo) | _sat_map(bm, wl.size, hi)) & bright
         n_sat = int((sat & ~keep).sum())
         keep |= sat
     info = dict(metric=f"HFDI {hwl:.0f}/{lwl:.0f}", hfdi_lo_nm=lwl, hfdi_hi_nm=hwl,
@@ -309,7 +315,7 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     rad = scene.radiance()
     obs = scene.obs()
     loc = scene.loc()
-    bm = scene.bandmask()
+    bm = None if args.no_bandmask else scene.bandmask()
     wl = np.asarray(rad.wl_nm, np.float64)
     fwhm = np.asarray(rad.fwhm_nm, np.float64)
     if wl.size != rad.nb or fwhm.size != rad.nb:
@@ -334,9 +340,11 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     else:
         mode = args.mode
     print(f"[scene] median SZA {sza_med:.2f} deg -> {mode}")
-    if mode == "day":
-        if not args.pca_basis:
-            raise RuntimeError("day scene needs --pca_basis")
+    # The PCA basis also defines the band set every fit uses, day and night: bands outside
+    # the cover-class/specmix grid (water-band edges, spectral ends) are fully masked, as in
+    # cover-class. Night needs no surface, but loads the basis for its band set when given.
+    basis = None
+    if args.pca_basis:
         key = f"{args.pca_basis}|{args.n_pc}|{wl.size}|{wl[0]:.3f}"
         if key not in basis_cache:
             basis_cache[key] = PCASurfaceBasis.from_npz(args.pca_basis, wl, n_pc=args.n_pc)
@@ -344,8 +352,11 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
             print(f"[pca] {Path(b.source).name}: {b.n_pc} PCs, approach {b.approach!r}, "
                   f"{b.grid_match}, {int(b.valid_1d.sum())}/{wl.size} bands defined")
         basis = basis_cache[key]
-    else:
-        basis = None
+    if mode == "day" and basis is None:
+        raise RuntimeError("day scene needs --pca_basis")
+    if basis is None:
+        print("[bands] WARNING: no --pca_basis, so night fits use every band outside the fixed bad "
+              "ranges, including the water-band edges; pass --pca_basis to use the cover-class band set")
 
     # ---- screen
     t_s = time.perf_counter()
@@ -451,6 +462,13 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     surface_1d = good & ranges_to_mask(wl, _parse_ranges(args.surface_window_ranges_nm, SURFACE_RANGES_NM_DEFAULT))
     hot_1d = good & ranges_to_mask(wl, _parse_ranges(args.hot_window_ranges_nm, HOT_RANGES_NM_DEFAULT))
     smol_1d = good & ranges_to_mask(wl, _parse_ranges(args.smolder_window_ranges_nm, SMOLDER_RANGES_NM_DEFAULT))
+    if basis is not None:
+        surface_1d &= basis.valid_1d
+        hot_1d &= basis.valid_1d
+        smol_1d &= basis.valid_1d
+        print(f"[bands] fit bands (cover-class set & window & not bad): surface {int(surface_1d.sum())}, "
+              f"hot {int(hot_1d.sum())}, smoulder {int(smol_1d.sum())}; bandmask-flagged bands are "
+              f"removed per pixel on top")
     swir2_1d = ranges_to_mask(wl, np.array([[args.eta_swir2_lo_nm, args.eta_swir2_hi_nm]]))
     swir1_1d = ranges_to_mask(wl, ETA_SWIR1_OVERRIDE_RANGES_NM_DEFAULT)
     sat2, sat1, eta_lo, eta_hi = eta_bounds_from_saturation(
@@ -459,6 +477,15 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
         eta_floor_swir2_only_sat=args.eta_floor_swir2_only_sat,
         eta_floor_swir1_and_swir2_sat=args.eta_floor_swir1_and_swir2_sat,
         eta_ceiling_low_sat=args.eta_ceiling_low_sat, eta_floor_max=args.eta_floor_max)
+
+    fitwin = hot_1d | smol_1d | (surface_1d if mode == "day" else False)
+    flag_frac = 1.0 - sat_ok[:, fitwin].mean(axis=1)
+    too_flagged = flag_frac > args.max_flagged_frac
+    print(f"[bandmask] candidates with any flagged fit band: {int((flag_frac > 0).sum())}/{rr.size}; "
+          f"> {args.max_flagged_frac:.0%} flagged (skipped): {int(too_flagged.sum())}")
+    if too_flagged.any():
+        obs_px = obs_px.copy()
+        obs_px[too_flagged] = np.nan          # the solver skips non-finite pixels
 
     night = mode == "night"
     cfg = MixtureRetrievalConfig(
@@ -489,7 +516,7 @@ def process_scene(scene: EmitScene, args, basis_cache: Dict[str, PCASurfaceBasis
     mu0 = np.cos(np.deg2rad(np.where(np.isfinite(sza_px), sza_px, sza))).astype(np.float32)
     res = run_pca_fire_retrieval(
         obs_px, wv_px, sat_ok, cfg=cfg, rte=rte, solar_irr=solar_irr, mu0=mu0, wl_nm=wl,
-        basis=basis, surface_1d=surface_1d, hot_1d=hot_1d, smolder_1d=smol_1d,
+        basis=basis if mode == "day" else None, surface_1d=surface_1d, hot_1d=hot_1d, smolder_1d=smol_1d,
         eta_lo=eta_lo, eta_hi=eta_hi, include_solar=not night,
         solar_scaling=args.solar_scaling, T1_init=T1_init, log_alpha1_init=la1_init,
         log_alpha_min=args.log_alpha_min, log_alpha_max=args.log_alpha_max,
@@ -571,6 +598,10 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--overwrite", action="store_true")
     g.add_argument("--no_geotiff", action="store_true", help="skip the GLT ortho GeoTIFFs")
     g.add_argument("--save_maps", action="store_true", help="also save full-scene mu/sigma/screen maps (npz)")
+    g.add_argument("--no_bandmask", action="store_true",
+                   help="ignore the L1B bandmask (no saturation auto-pass, all bands treated as unsaturated)")
+    g.add_argument("--max_flagged_frac", type=float, default=0.5,
+                   help="skip candidates with more than this fraction of fit-window bands flagged in the bandmask")
 
     g = p.add_argument_group("day / night")
     g.add_argument("--mode", choices=("auto", "day", "night"), default="auto")
@@ -579,7 +610,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="median SZA at or below this = day (the LUT solar_zenith axis ends at 75)")
 
     g = p.add_argument_group("PCA surface (day)")
-    g.add_argument("--pca_basis", default=None, help="pca_surface_*.npz from the specmix notebook")
+    g.add_argument("--pca_basis", default=None,
+                   help="pca_surface_*.npz from the specmix notebook; required by day, and at night it "
+                        "sets the fit band set (bands outside the cover-class grid are fully masked)")
     g.add_argument("--n_pc", type=int, default=8)
     g.add_argument("--pca_prior_weight", type=float, default=1.0, help="weight on the N(0,I) whitened-score prior")
     g.add_argument("--rfl_bounds_weight", type=float, default=1.0e4, help="penalty on reflectance outside [0,1]")
